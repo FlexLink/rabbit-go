@@ -31,6 +31,7 @@ type Rabbit struct {
 	amqpMsgs     *<-chan amqp.Delivery
 	disconnected chan *amqp.Error
 	subscribers  map[string]func(*amqp.Delivery)
+	bindigs		 map[string][]string
 	quitAuto     chan bool
 	isOpen       bool
 	exchanges    []string
@@ -42,6 +43,7 @@ func NewRabbit(conf *Config) *Rabbit {
 		conf:         conf,
 		disconnected: make(chan *amqp.Error, 2),
 		subscribers:  make(map[string]func(*amqp.Delivery), 10),
+		bindigs: make(map[string][]string, 0),
 		quitAuto:     make(chan bool),
 		isOpen:       false,
 		exchanges:    []string{},
@@ -71,8 +73,9 @@ func (c *Rabbit) AutoConnect(timeout int) {
 				c.amqpConn.NotifyClose(c.disconnected)
 
 				// subscribe all recievers
-				for _, handler := range c.subscribers {
-					c.subscribe(handler)
+				for key, handler := range c.subscribers {
+					c.subscribeWithBindings(key, handler)
+//					c.subscribe(handler)
 				}
 			case <-c.quitAuto:
 				log.Println("[INFO] rabbit.autoconnect quit")
@@ -176,6 +179,13 @@ func (c *Rabbit) Subscribe(receiver string, handler func(*amqp.Delivery)) error 
 	return nil
 }
 
+// Subscribe register a callback by receiver's name
+func (c *Rabbit) SubscribeWithBindings(bindings []string, receiver string, handler func(*amqp.Delivery)) error {
+	c.subscribers[receiver] = handler
+	c.bindigs[receiver] = bindings
+	return nil
+}
+
 func (c *Rabbit) subscribe(handler func(*amqp.Delivery)) error {
 	ch := c.amqpChannel
 	if ch == nil {
@@ -196,7 +206,57 @@ func (c *Rabbit) subscribe(handler func(*amqp.Delivery)) error {
 
 	msgs, err := ch.Consume(
 		c.amqpQueue.Name, // queue
-		"opc2rmq-go",     // consumer
+		"def",     // consumer
+		true,             // auto-ack
+		false,            // exclusive
+		false,            // no-local
+		false,            // no-wait
+		nil,              // args
+	)
+	if err != nil {
+		failOnError(err, "Failed to register a consumer")
+	}
+
+	c.amqpMsgs = &msgs
+
+	go func() {
+		for d := range *c.amqpMsgs {
+			if c.conf.Verbose {
+				log.Printf("[DEBUG] reseived: %v\n", d)
+			}
+			handler(&d)
+		}
+	}()
+
+	return nil
+}
+
+func (c *Rabbit) subscribeWithBindings(receiver string, handler func(*amqp.Delivery)) error {
+	ch := c.amqpChannel
+	if ch == nil {
+		return errors.New("in Rabbit.subscribe() amqp.Channel is null")
+	}
+
+	bindings, ok := c.bindigs[receiver]
+	if !ok {
+		bindings = []string{ c.conf.BindingKey }
+	}
+	for _, key := range bindings {
+		err := ch.QueueBind(
+			c.amqpQueue.Name,  	// queue name
+			key, 				// routing key
+			c.conf.Exchange,   	// exchange
+			false,
+			nil,
+		)
+		if err != nil {
+			failOnError(err, "Failed to bind a queue")
+		}
+	}
+
+	msgs, err := ch.Consume(
+		c.amqpQueue.Name, // queue
+		receiver,     	  // consumer
 		true,             // auto-ack
 		false,            // exclusive
 		false,            // no-local
